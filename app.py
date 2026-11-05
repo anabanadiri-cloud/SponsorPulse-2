@@ -30,6 +30,11 @@ def load_data():
     return df
 
 df=load_data()
+# Convert announcement dates into years
+df["year"] = pd.to_datetime(
+    df["announcement_date"],
+    errors="coerce"
+).dt.year
 st.markdown('### 📈 Sponsor<span style="color:#38bdf8">Pulse</span>  ·  INSTITUTIONAL EDITION',unsafe_allow_html=True)
 st.caption('Target Sponsor: Norwest Equity Partners (NEP) · FINC 314 project')
 st.title('Private Equity Deal Sourcing & Operational Intelligence')
@@ -38,12 +43,26 @@ st.warning('**Sample / offline mode:** This dashboard uses the eight fallback an
 
 with st.sidebar:
     st.header('Explore announcements')
+        # Filter announcements by year
+    available_years = sorted(
+        df["year"].dropna().astype(int).unique(),
+        reverse=True
+    )
+
+    selected_years = st.multiselect(
+        "Announcement Year",
+        available_years,
+        default=[2026] if 2026 in available_years else available_years
+    )
     direction=st.multiselect('Investment direction',sorted(df['deal_direction'].unique()),default=sorted(df['deal_direction'].unique()))
     types=st.multiselect('Transaction type',sorted(df['transaction_type'].unique()),default=sorted(df['transaction_type'].unique()))
     query=st.text_input('Search company, headline, buyer or industry',placeholder='E-Z UP, Thibaut, Consumer…')
     only_deals=st.checkbox('Verified deals only (model classification)',value=False)
 
 filtered=df[df['deal_direction'].isin(direction)&df['transaction_type'].isin(types)].copy()
+filtered = filtered[
+    filtered["year"].isin(selected_years)
+]
 if only_deals: filtered=filtered[filtered['is_verified_deal']]
 if query.strip():
     searchable=filtered[['target_company','headline','buyer_entity','target_industry']].astype(str).agg(' '.join,axis=1)
