@@ -894,9 +894,12 @@ def review_existing(
 
             for field in fields:
 
-                df.at[index, field] = (
-                    result[field]
-                )
+                value = result[field]
+
+                if field == "deal_value_disclosed":
+                    value = str(value)
+
+                df.at[index, field] = value
 
             df.at[
                 index,
