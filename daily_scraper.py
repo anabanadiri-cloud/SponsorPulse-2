@@ -1,3 +1,5 @@
+"""SponsorPulse 2.1 - Multi-firm historical announcement collector.
+
 Sources:
 - Norwest Equity Partners (9 news pages)
 - Tonka Bay Equity Partners (recent news and 2022-2024 archives)
