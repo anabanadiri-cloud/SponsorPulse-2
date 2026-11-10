@@ -366,7 +366,39 @@ def lead_event(text, sponsor):
     """
 
     lead = text[:1800]
+    # --------------------------------------------------------
+    # SPONSOR INVESTMENTS
+    # Recognizes "has made a significant investment in..."
+    # --------------------------------------------------------
 
+    investment_pattern = re.compile(
+        r"\b(?:Norwest Equity Partners|NEP|"
+        r"Tonka Bay Equity Partners|Tonka Bay)\b"
+        r"[^.!?]{0,250}?"
+        r"\b(?:has\s+|have\s+)?"
+        r"(?:made\s+(?:a|an)\s+"
+        r"(?:(?:significant|strategic|growth|"
+        r"minority|majority|equity)\s+){0,4}"
+        r"investment\s+in|invested\s+in)\s+"
+        r"(?P<target>[A-Z][^,;(\n.]{1,110})",
+        re.I,
+    )
+
+    investment_match = investment_pattern.search(lead)
+
+    if investment_match:
+
+        target = clean_company(
+            investment_match.group("target")
+        )
+
+        return (
+            "Platform Investment",
+            BUY,
+            sponsor,
+            target,
+            investment_match.group(0),
+        )
     # --------------------------------------------------------
     # 1. SPONSOR ACQUISITIONS
     # --------------------------------------------------------
