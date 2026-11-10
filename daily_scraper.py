@@ -23,6 +23,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import pandas as pd
+import xml.etree.ElementTree as ET
 import requests
 
 from bs4 import BeautifulSoup
@@ -170,7 +171,265 @@ def get_html(session, url):
 # ============================================================
 # DISCOVER ANNOUNCEMENTS
 # ============================================================
+def discover_historical_links(session, source, delay=1.0):
+    """
+    Discover older official news articles using XML sitemaps.
 
+    If sitemap coverage is limited, try a public
+    WordPress API where available.
+
+    Existing CSV data is never changed here.
+    """
+
+    domain = source["domain"]
+    base = "https://" + domain
+
+    sitemap_queue = [
+        base + "/sitemap.xml",
+        base + "/sitemap_index.xml",
+        base + "/wp-sitemap.xml",
+    ]
+
+    visited = set()
+    found = {}
+
+    # Check whether the website declares another sitemap.
+
+    try:
+        robots = session.get(
+            base + "/robots.txt",
+            timeout=15,
+        )
+
+        if robots.ok:
+            for line in robots.text.splitlines():
+
+                if line.lower().startswith("sitemap:"):
+
+                    address = line.split(":", 1)[1].strip()
+
+                    host = (
+                        urlparse(address)
+                        .netloc.lower()
+                        .removeprefix("www.")
+                    )
+
+                    if host == domain:
+                        sitemap_queue.append(address)
+
+    except requests.RequestException:
+        pass
+
+    # -------------------------------------------------
+    # SEARCH XML SITEMAPS
+    # -------------------------------------------------
+
+    while sitemap_queue and len(visited) < 60:
+
+        address = sitemap_queue.pop(0)
+
+        if address in visited:
+            continue
+
+        visited.add(address)
+
+        try:
+            response = session.get(
+                address,
+                timeout=25,
+            )
+
+            response.raise_for_status()
+
+            root = ET.fromstring(
+                response.content
+            )
+
+        except (
+            requests.RequestException,
+            ET.ParseError,
+        ):
+            continue
+
+        for node in root:
+
+            kind = node.tag.rsplit("}", 1)[-1]
+
+            location = next(
+                (
+                    child.text.strip()
+                    for child in node
+                    if (
+                        child.tag.rsplit("}", 1)[-1] == "loc"
+                        and child.text
+                    )
+                ),
+                None,
+            )
+
+            if not location:
+                continue
+
+            parsed = urlparse(location)
+
+            host = (
+                parsed.netloc.lower()
+                .removeprefix("www.")
+            )
+
+            if host != domain:
+                continue
+
+            # Some sitemaps point to other sitemaps.
+
+            if kind == "sitemap":
+
+                if (
+                    location not in visited
+                    and location not in sitemap_queue
+                ):
+                    sitemap_queue.append(location)
+
+            # Collect actual news article URLs.
+
+            elif (
+                kind == "url"
+                and re.fullmatch(
+                    r"/news/[^/]+/?",
+                    parsed.path,
+                    re.I,
+                )
+            ):
+
+                url = canonical_url(location)
+
+                headline = (
+                    parsed.path.strip("/")
+                    .split("/")[-1]
+                    .replace("-", " ")
+                    .title()
+                )
+
+                found.setdefault(
+                    url,
+                    headline,
+                )
+
+        time.sleep(delay)
+
+    LOG.info(
+        "%s: sitemap discovery found %s news links",
+        source["code"],
+        len(found),
+    )
+
+    # -------------------------------------------------
+    # FALLBACK: PUBLIC WORDPRESS API
+    # -------------------------------------------------
+
+    if len(found) < 30:
+
+        for resource in ("posts", "news"):
+
+            endpoint = (
+                base
+                + "/wp-json/wp/v2/"
+                + resource
+            )
+
+            for page in range(1, 11):
+
+                try:
+                    response = session.get(
+                        endpoint,
+                        params={
+                            "per_page": 100,
+                            "page": page,
+                            "_fields": "link,title,date",
+                        },
+                        timeout=25,
+                    )
+
+                    if response.status_code != 200:
+                        break
+
+                    items = response.json()
+
+                    if (
+                        not isinstance(items, list)
+                        or not items
+                    ):
+                        break
+
+                except (
+                    requests.RequestException,
+                    ValueError,
+                ):
+                    break
+
+                for item in items:
+
+                    link = str(
+                        item.get("link", "")
+                    )
+
+                    parsed = urlparse(link)
+
+                    host = (
+                        parsed.netloc.lower()
+                        .removeprefix("www.")
+                    )
+
+                    if (
+                        host == domain
+                        and re.fullmatch(
+                            r"/news/[^/]+/?",
+                            parsed.path,
+                            re.I,
+                        )
+                    ):
+
+                        url = canonical_url(link)
+
+                        headline = (
+                            parsed.path.strip("/")
+                            .split("/")[-1]
+                            .replace("-", " ")
+                            .title()
+                        )
+
+                        found.setdefault(
+                            url,
+                            headline,
+                        )
+
+                time.sleep(delay)
+
+                if len(items) < 100:
+                    break
+
+            if len(found) >= 30:
+                break
+
+    # -------------------------------------------------
+    # REPORT DISCOVERY RESULTS
+    # -------------------------------------------------
+
+    LOG.info(
+        "%s: total historical news links discovered = %s",
+        source["code"],
+        len(found),
+    )
+
+    if not found:
+
+        LOG.warning(
+            "%s: no historical links discovered. "
+            "Original news-page discovery will still run.",
+            source["code"],
+        )
+
+    return found
 def discover_links(soup, page_url, domain):
 
     found = {}
@@ -1096,7 +1355,17 @@ def update(
             continue
 
         links = {}
+        # Expand historical coverage for Audax and Shore.
 
+        if source["code"] in ("AUDAX", "SHORE"):
+
+            historical_links = discover_historical_links(
+                session,
+                source,
+                delay=delay,
+            )
+
+            links.update(historical_links)
         # Read current and historical news indexes.
 
         for page in source["pages"]:
@@ -1166,7 +1435,26 @@ def update(
                     ),
                     title,
                 )
+                # Keep the new firms' dated announcements
+                # within the requested historical range.
 
+                if source["code"] in ("AUDAX", "SHORE"):
+
+                    if date:
+
+                        year_match = re.match(
+                            r"^(\d{4})",
+                            str(date),
+                        )
+
+                        if year_match:
+
+                            article_year = int(
+                                year_match.group(1)
+                            )
+
+                            if not 2014 <= article_year <= 2026:
+                                continue
                 key = (
                     source["name"].lower(),
                     title_key(headline),
