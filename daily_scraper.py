@@ -65,6 +65,22 @@ SOURCES = (
             "https://tonkabayequity.com/news_year_5/",
         ],
     },
+    {
+        "name": "Audax Private Equity",
+        "code": "AUDAX",
+        "domain": "audaxprivateequity.com",
+        "pages": [
+            "https://audaxprivateequity.com/news",
+        ],
+    },
+    {
+        "name": "Shore Capital Partners",
+        "code": "SHORE",
+        "domain": "shorecp.com",
+        "pages": [
+            "https://www.shorecp.com/news",
+        ],
+    },
 )
 
 
@@ -373,7 +389,9 @@ def lead_event(text, sponsor):
 
     investment_pattern = re.compile(
         r"\b(?:Norwest Equity Partners|NEP|"
-        r"Tonka Bay Equity Partners|Tonka Bay)\b"
+        r"Tonka Bay Equity Partners|Tonka Bay|"
+        r"Audax Private Equity|Audax|"
+        r"Shore Capital Partners|Shore Capital)\b"
         r"[^.!?]{0,250}?"
         r"\b(?:has\s+|have\s+)?"
         r"(?:made\s+(?:a|an)\s+"
@@ -408,7 +426,11 @@ def lead_event(text, sponsor):
         r"Norwest Equity Partners|"
         r"NEP|"
         r"Tonka Bay Equity Partners|"
-        r"Tonka Bay"
+        r"Tonka Bay|"
+        r"Audax Private Equity|"
+        r"Audax|"
+        r"Shore Capital Partners|"
+        r"Shore Capital"
         r")"
         r"\b[^.!?]{0,200}?"
         r"\b(?:has\s+|have\s+|recently\s+)?"
@@ -468,7 +490,9 @@ def lead_event(text, sponsor):
 
     pattern = re.compile(
         r"\b(?:Norwest Equity Partners|NEP|"
-        r"Tonka Bay Equity Partners|Tonka Bay)"
+        r"Tonka Bay Equity Partners|Tonka Bay|"
+        r"Audax Private Equity|Audax|"
+        r"Shore Capital Partners|Shore Capital)\b"
         r"\b[^.!?]{0,120}?"
         r"\b(?:has\s+)?"
         r"(?:sold|divested)\s+"
@@ -1328,6 +1352,8 @@ if __name__ == "__main__":
             "all",
             "nep",
             "tonka",
+            "audax",
+            "shore",
         ],
         default="all",
     )
