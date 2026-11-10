@@ -1,11 +1,13 @@
-"""SponsorPulse 2.1 - Multi-firm historical announcement collector.
+"""SponsorPulse 2.3: full-article PE news collection and classification.
 
-Sources:
-- Norwest Equity Partners (9 news pages)
-- Tonka Bay Equity Partners (recent news and 2022-2024 archives)
+This scraper:
+1. Collects announcements from Norwest and Tonka Bay.
+2. Reads the article body, not just the headline.
+3. Extracts explicit acquisition and sale information.
+4. Rechecks existing "Review Required" announcements.
+5. Preserves existing CSV records and prevents duplicates.
 
-New announcements are automatically classified, NOT independently verified.
-Existing CSV records are preserved.
+Automatic classifications are NOT independent verification.
 """
 
 from __future__ import annotations
@@ -15,28 +17,39 @@ import hashlib
 import logging
 import re
 import time
+
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import pandas as pd
 import requests
+
 from bs4 import BeautifulSoup
 
 
 LOG = logging.getLogger("sponsorpulse")
 
 HEADERS = {
-    "User-Agent": "SponsorPulseAcademicResearch/1.0 (public news monitoring)"
+    "User-Agent": (
+        "SponsorPulseAcademicResearch/1.0 "
+        "(public news monitoring)"
+    )
 }
+
+
+# ============================================================
+# SOURCES
+# ============================================================
 
 SOURCES = (
     {
         "name": "Norwest Equity Partners",
         "code": "NEP",
         "domain": "nep.com",
-        "pages": ["https://nep.com/news/"]
-        + [
+        "pages": [
+            "https://nep.com/news/"
+        ] + [
             f"https://nep.com/news/?current-page={n}"
             for n in range(2, 10)
         ],
@@ -53,6 +66,7 @@ SOURCES = (
         ],
     },
 )
+
 
 COLUMNS = [
     "deal_id",
@@ -74,71 +88,105 @@ COLUMNS = [
     "data_origin",
 ]
 
+
+BUY = "BUY / INVESTMENT"
+SELL = "SELL / EXIT"
+OTHER = "OTHER / NON-DEAL"
+REVIEW = "REVIEW REQUIRED"
+
+
 DATE_REGEX = re.compile(
-    r"\b(?:January|February|March|April|May|June|July|August|"
-    r"September|October|November|December)\s+\d{1,2},?\s+20\d{2}\b",
+    r"\b(?:January|February|March|April|May|June|July|"
+    r"August|September|October|November|December)"
+    r"\s+\d{1,2},?\s+20\d{2}\b",
     re.I,
 )
 
 
-def canonical_url(url: str) -> str:
-    """Standardize URLs to help prevent duplicate records."""
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def canonical_url(url):
+
     parsed = urlparse(str(url).strip())
-    netloc = parsed.netloc.lower().removeprefix("www.")
+
+    domain = parsed.netloc.lower().removeprefix("www.")
+
     path = "/" + parsed.path.strip("/") + "/"
 
     return urlunparse(
-        (parsed.scheme.lower() or "https", netloc, path, "", "", "")
+        (
+            parsed.scheme.lower() or "https",
+            domain,
+            path,
+            "",
+            "",
+            "",
+        )
     )
 
 
-def normalized_title(title: str) -> str:
-    """Normalize headlines for duplicate detection."""
+def title_key(value):
+
     return re.sub(
-        r"[^a-z0-9]+", " ", str(title).lower()
+        r"[^a-z0-9]+",
+        " ",
+        str(value).lower(),
     ).strip()
 
 
-def get_html(
-    session: requests.Session,
-    url: str
-) -> BeautifulSoup:
+def get_html(session, url):
 
-    response = session.get(url, timeout=25)
+    response = session.get(
+        url,
+        timeout=25,
+    )
+
     response.raise_for_status()
 
-    return BeautifulSoup(response.text, "html.parser")
+    return BeautifulSoup(
+        response.text,
+        "html.parser",
+    )
 
 
-def discover_links(
-    soup: BeautifulSoup,
-    page_url: str,
-    domain: str
-) -> list[tuple[str, str]]:
+# ============================================================
+# DISCOVER ANNOUNCEMENTS
+# ============================================================
 
-    """Find article links on a source's news page."""
+def discover_links(soup, page_url, domain):
+
     found = {}
 
     for anchor in soup.select("a[href]"):
 
-        link = canonical_url(
-            urljoin(page_url, anchor.get("href", ""))
+        url = canonical_url(
+            urljoin(
+                page_url,
+                anchor.get("href", ""),
+            )
         )
 
-        parsed = urlparse(link)
+        parsed = urlparse(url)
 
-        if parsed.netloc != domain:
-            continue
-
-        components = parsed.path.strip("/").split("/")
+        parts = (
+            parsed.path
+            .strip("/")
+            .split("/")
+        )
 
         if (
-            len(components) != 2
-            or components[0].lower() != "news"
+            parsed.netloc != domain
+            or len(parts) != 2
+            or parts[0].lower() != "news"
         ):
             continue
 
-        headline = anchor.get_text(" ", strip=True)
+        headline = anchor.get_text(
+            " ",
+            strip=True,
+        )
 
         if len(headline) < 18:
             continue
@@ -153,86 +201,123 @@ def discover_links(
         }:
             continue
 
-        found.setdefault(link, headline)
+        found.setdefault(
+            url,
+            headline,
+        )
 
     return list(found.items())
 
 
-def article_details(
-    soup: BeautifulSoup,
-    fallback_title: str
-) -> tuple[str, str, str]:
+# ============================================================
+# FULL-ARTICLE READING
+# ============================================================
 
-    """Extract headline, announcement date and article text."""
+def article_details(soup, fallback_title):
+    """
+    Read the complete article body.
 
-    main = (
+    The transaction classifier uses the article's
+    opening description to avoid confusing old
+    acquisitions mentioned in company background
+    sections with the newly announced transaction.
+    """
+
+    root = (
         soup.find("article")
         or soup.find("main")
         or soup
     )
 
+    # Remove surrounding page elements.
+
+    for node in root.select(
+        "script, style, nav, footer, form"
+    ):
+        node.decompose()
+
     heading = (
-        main.find("h1")
-        or main.find("h2")
+        root.find("h1")
         or soup.find("h1")
-        or soup.find("h2")
     )
 
-    title = (
+    headline = (
         heading.get_text(" ", strip=True)
         if heading
         else fallback_title
     )
 
+    # Collect all substantial paragraphs.
+
     paragraphs = [
         p.get_text(" ", strip=True)
-        for p in main.find_all("p")
+        for p in root.find_all("p")
     ]
 
     body = " ".join(
-        p for p in paragraphs if len(p) >= 25
-    )[:15000]
+        paragraph
+        for paragraph in paragraphs
+        if len(paragraph) >= 20
+    )[:25000]
 
     if len(body) < 60:
-        body = main.get_text(" ", strip=True)[:15000]
+        body = root.get_text(
+            " ",
+            strip=True,
+        )[:25000]
+
+    # Find publication date.
 
     date = ""
 
-    for attr, key in [
+    for attribute, key in [
         ("property", "article:published_time"),
         ("name", "date"),
         ("name", "publish_date"),
         ("itemprop", "datePublished"),
     ]:
 
-        tag = soup.find("meta", attrs={attr: key})
+        tag = soup.find(
+            "meta",
+            attrs={attribute: key},
+        )
 
         if tag and tag.get("content"):
             date = tag["content"].strip()
             break
 
     if not date:
-        tag = main.find("time") or soup.find("time")
+
+        tag = (
+            root.find("time")
+            or soup.find("time")
+        )
 
         if tag:
+
             date = (
                 tag.get("datetime")
                 or tag.get_text(" ", strip=True)
             ).strip()
 
     if not date:
+
         match = DATE_REGEX.search(
-            main.get_text(" ", strip=True)[:1300]
+            root.get_text(
+                " ",
+                strip=True,
+            )[:1800]
         )
 
         if match:
-            date = match.group(0)
+            date = match.group()
 
     if date:
+
         parsed = pd.to_datetime(
             date,
             errors="coerce",
-            utc=True
+            utc=True,
         )
 
         date = (
@@ -241,258 +326,430 @@ def article_details(
             else ""
         )
 
-    return title, date, body
+    return headline, date, body
 
 
-def classify(
-    headline: str,
-    body: str,
-    sponsor: str
-) -> dict:
+# ============================================================
+# EXTRACT COMPANY NAMES
+# ============================================================
 
-    """Classify announcements conservatively.
+def clean_company(value):
 
-    These are candidate classifications, not verified deals.
+    company = re.split(
+        r"\s*(?:\(|,|;|\.|\s+from\s+|\s+in\s+an?\s+)\s*",
+        value.strip(),
+        maxsplit=1,
+        flags=re.I,
+    )[0]
+
+    return company.strip(
+        " –-: "
+    )[:120]
+
+
+# ============================================================
+# FIND TRANSACTIONS INSIDE THE ARTICLE
+# ============================================================
+
+def lead_event(text, sponsor):
+    """
+    Look for explicit acquisition or exit language.
+
+    Example:
+    'Norwest Equity Partners (NEP), a leading
+    investment platform, has acquired MDC
+    Interior Solutions.'
+
+    The opening section is prioritized because
+    background paragraphs can mention transactions
+    that occurred years earlier.
+    """
+
+    lead = text[:1800]
+
+    # --------------------------------------------------------
+    # 1. SPONSOR ACQUISITIONS
+    # --------------------------------------------------------
+
+    pattern = re.compile(
+        r"\b(?P<buyer>"
+        r"Norwest Equity Partners|"
+        r"NEP|"
+        r"Tonka Bay Equity Partners|"
+        r"Tonka Bay"
+        r")"
+        r"\b[^.!?]{0,200}?"
+        r"\b(?:has\s+|have\s+|recently\s+)?"
+        r"(?:acquired|acquires|purchased|"
+        r"agreed\s+to\s+acquire)\s+"
+        r"(?P<target>[A-Z][^.;\n]{2,135})",
+        re.I,
+    )
+
+    match = pattern.search(lead)
+
+    if match:
+
+        target = clean_company(
+            match.group("target")
+        )
+
+        return (
+            "Platform Investment",
+            BUY,
+            sponsor,
+            target,
+            match.group(0),
+        )
+
+    # --------------------------------------------------------
+    # 2. OPERATING COMPANY ACQUISITIONS
+    # --------------------------------------------------------
+
+    pattern = re.compile(
+        r"\b(?P<buyer>"
+        r"[A-Z][\w&.'-]+"
+        r"(?:\s+[A-Z][\w&.'-]+){0,5}"
+        r")\s+"
+        r"(?:has\s+)?"
+        r"(?:acquired|acquires|purchased)\s+"
+        r"(?P<target>[A-Z][^.;\n]{2,135})"
+    )
+
+    match = pattern.search(lead)
+
+    if match:
+
+        return (
+            "Add-On Acquisition",
+            BUY,
+            match.group("buyer"),
+            clean_company(
+                match.group("target")
+            ),
+            match.group(0),
+        )
+
+    # --------------------------------------------------------
+    # 3. SPONSOR EXITS
+    # --------------------------------------------------------
+
+    pattern = re.compile(
+        r"\b(?:Norwest Equity Partners|NEP|"
+        r"Tonka Bay Equity Partners|Tonka Bay)"
+        r"\b[^.!?]{0,120}?"
+        r"\b(?:has\s+)?"
+        r"(?:sold|divested)\s+"
+        r"(?P<target>[A-Z][^.;\n]{2,135})",
+        re.I,
+    )
+
+    match = pattern.search(lead)
+
+    if match:
+
+        return (
+            "Full Exit / Sale",
+            SELL,
+            "",
+            clean_company(
+                match.group("target")
+            ),
+            match.group(0),
+        )
+
+    return None
+
+
+# ============================================================
+# CLASSIFICATION
+# ============================================================
+
+def classify(headline, body, sponsor):
+    """
+    Classify using headline AND article body.
+
+    The result is an automated candidate label.
+    Human verification is still required.
     """
 
     title = headline.lower()
-    text = (headline + " " + body).lower()
+
+    text = headline + " " + body
+
+    tx = "Needs Manual Review"
+    direction = REVIEW
+
+    buyer = ""
+    target = ""
+    evidence = ""
+
+    # --------------------------------------------------------
+    # OBVIOUS CORPORATE NEWS
+    # --------------------------------------------------------
 
     if any(
-        x in title
-        for x in (
+        term in title
+        for term in (
             "appoints",
-            "appointed",
             "appointment",
+            "new ceo",
             "named partner",
-            "named a",
             "promoted",
-            "promotes",
-            "joins tonka",
+            "named chief",
             "award",
             "honored",
             "podcast",
-            "featured",
             "interviewed",
             "volunteer",
             "community impact",
             "recogniz",
         )
     ):
+
         tx = "Personnel / Non-Deal"
-        direction = "OTHER / NON-DEAL"
+        direction = OTHER
+
+    # --------------------------------------------------------
+    # FUNDRAISING
+    # --------------------------------------------------------
 
     elif (
         ("fund" in title or "capital" in title)
         and any(
-            x in title
-            for x in (
-                "closes",
-                "closing",
+            term in title
+            for term in (
+                "closes on",
+                "fund closing",
                 "raised",
                 "fundraise",
             )
         )
     ):
+
         tx = "Fundraising / Capital Close"
-        direction = "OTHER / NON-DEAL"
-
-    elif any(
-        x in title
-        for x in (
-            "sale of",
-            "announces sale",
-            "sells",
-            "sold to",
-            "divests",
-            "exit from",
-        )
-    ):
-        tx = "Full Exit / Sale"
-        direction = "SELL / EXIT"
-
-    elif any(
-        x in title
-        for x in (
-            "acquires",
-            "acquire",
-            "acquisition of",
-            "announces acquisition",
-            "merger with",
-        )
-    ):
-        tx = "Add-On Acquisition"
-        direction = "BUY / INVESTMENT"
-
-    elif any(
-        x in title
-        for x in (
-            "investment in",
-            "invests in",
-            "investment into",
-            "announces investment",
-        )
-    ):
-        tx = "Platform Investment"
-        direction = "BUY / INVESTMENT"
+        direction = OTHER
 
     else:
-        tx = "Needs Manual Review"
-        direction = "REVIEW REQUIRED"
 
-    buyer = ""
-    target = ""
+        # Read the actual article's transaction language.
 
-    if tx == "Full Exit / Sale":
-
-        match = re.search(
-            r"\bSale of\s+(.+?)\s+to\s+(.+)$",
-            headline,
-            re.I,
+        event = (
+            lead_event(body, sponsor)
+            if body
+            else None
         )
 
-        if match:
-            target = match.group(1).strip()
-            buyer = match.group(2).strip()
+        if event:
 
-        else:
+            (
+                tx,
+                direction,
+                buyer,
+                target,
+                evidence,
+            ) = event
+
+        # Fallback: recognize explicit transaction headlines.
+
+        elif any(
+            term in title
+            for term in (
+                "sale of",
+                "announces sale",
+                "sells",
+                "sold to",
+                "divests",
+                "exit from",
+            )
+        ):
+
+            tx = "Full Exit / Sale"
+            direction = SELL
+
             match = re.search(
-                r"\bSells\s+(.+?)\s+to\s+(.+)$",
+                r"\b(?:Sale of|Sells)\s+"
+                r"(.+?)\s+to\s+(.+)$",
                 headline,
                 re.I,
             )
 
             if match:
-                target = match.group(1).strip()
-                buyer = match.group(2).strip()
 
-    elif tx == "Platform Investment":
+                target = clean_company(
+                    match.group(1)
+                )
 
-        match = re.search(
-            r"\b(?:Investment in|Invests in|Investment into)"
-            r"\s+(.+?)(?:[,;]|$)",
-            headline,
-            re.I,
-        )
+                buyer = clean_company(
+                    match.group(2)
+                )
 
-        if match:
-            target = match.group(1).strip()
+        elif any(
+            term in title
+            for term in (
+                "acquires",
+                "acquire",
+                "acquisition of",
+                "announces acquisition",
+                "merger with",
+            )
+        ):
+
+            tx = "Add-On Acquisition"
+            direction = BUY
+
+            match = re.search(
+                r"^(.+?)\s+"
+                r"(?:Announces Agreement to\s+)?"
+                r"Acquires?\s+(.+)$",
+                headline,
+                re.I,
+            )
+
+            if match:
+
+                buyer = clean_company(
+                    match.group(1)
+                )
+
+                target = clean_company(
+                    match.group(2)
+                )
+
+        elif any(
+            term in title
+            for term in (
+                "investment in",
+                "invests in",
+                "investment into",
+                "announces investment",
+            )
+        ):
+
+            tx = "Platform Investment"
+            direction = BUY
             buyer = sponsor
 
-    elif tx == "Add-On Acquisition":
-
-        match = re.search(
-            r"^(.+?)\s+(?:Announces\s+)?"
-            r"(?:Agreement to\s+)?Acquires?\s+(.+)$",
-            headline,
-            re.I,
-        )
-
-        if match:
-            buyer = match.group(1).strip()
-            target = match.group(2).strip()
-
-        else:
             match = re.search(
-                r"^(.+?)\s+Announces Acquisition of\s+(.+)$",
+                r"\b(?:Investment in|Invests in)"
+                r"\s+(.+?)(?:,|$)",
                 headline,
                 re.I,
             )
 
             if match:
-                buyer = match.group(1).strip()
-                target = match.group(2).strip()
 
-    # Identify possible target industry
+                target = clean_company(
+                    match.group(1)
+                )
+
+    # --------------------------------------------------------
+    # INDUSTRY EXTRACTION
+    # --------------------------------------------------------
+
+    lower_text = text.lower()
 
     if any(
-        x in text
-        for x in (
-            "managed it",
+        word in lower_text
+        for word in (
             "it services",
+            "managed it",
             "cybersecurity",
             "software",
-            "technology",
         )
     ):
+
         industry = "Business & IT Services"
 
     elif any(
-        x in text
-        for x in (
-            "canopy",
+        word in lower_text
+        for word in (
             "wallcoverings",
+            "interior finishes",
+            "interior solutions",
             "textiles",
+            "canopy",
             "produce",
             "food",
         )
     ):
+
         industry = "Consumer Products & Distribution"
 
     elif any(
-        x in text
-        for x in (
-            "manufacturing",
-            "industrial",
+        word in lower_text
+        for word in (
             "bearing",
             "locknut",
+            "manufacturing",
+            "industrial",
             "coatings",
         )
     ):
+
         industry = "Industrial Manufacturing"
 
     else:
+
         industry = "Unknown / Needs Review"
 
-    # Identify possible strategic rationale
+    # --------------------------------------------------------
+    # STRATEGIC RATIONALE
+    # --------------------------------------------------------
 
     if any(
-        x in text
-        for x in (
+        word in lower_text
+        for word in (
             "geographic expansion",
             "geographic footprint",
             "expand its footprint",
-            "expands its footprint",
-            "broadening its reach",
         )
     ):
+
         rationale = "Geographic Expansion"
 
     elif any(
-        x in text
-        for x in (
-            "product offering",
-            "product range",
+        word in lower_text
+        for word in (
             "product line",
+            "product range",
             "capabilities",
-            "capability",
-            "innovation",
             "distribution",
-            "cross-sell",
+            "innovation",
         )
     ):
-        rationale = "Product Line & Capability Extension"
+
+        rationale = (
+            "Product Line & Capability Extension"
+        )
 
     else:
+
         rationale = "Not stated / Needs Review"
 
-    # Detect whether a deal value appears in the text.
-    # It must still be checked manually.
+    # --------------------------------------------------------
+    # FINANCIAL DISCLOSURE
+    # --------------------------------------------------------
 
-    price = bool(
-        re.search(
-            r"\$\s*\d+(?:\.\d+)?\s*"
-            r"(?:million|billion|m|bn)\b",
-            text,
-            re.I,
+    price_disclosed = (
+        direction in (BUY, SELL)
+        and bool(
+            re.search(
+                r"\$\s*\d+(?:\.\d+)?\s*"
+                r"(?:million|billion|m|bn)\b",
+                text,
+                re.I,
+            )
         )
     )
 
-    if direction not in (
-        "BUY / INVESTMENT",
-        "SELL / EXIT",
-    ):
-        price = False
+    # Prefer transaction evidence when available.
+
+    snippet = (
+        evidence[:350]
+        if evidence
+        else (body[:350] if body else headline)
+    )
 
     return {
         "is_verified_deal": False,
@@ -502,142 +759,365 @@ def classify(
         "target_company": target,
         "target_industry": industry,
         "strategic_rationale": rationale,
-        "deal_value_disclosed": price,
-        "evidence_snippet": (
-            body[:300] if body else headline
+        "deal_value_disclosed": price_disclosed,
+        "evidence_snippet": snippet,
+        "review_status": (
+            "Full-text candidate — "
+            "pending manual source verification"
         ),
-        "review_status": "Pending manual verification",
     }
 
 
-def update(
-    csv_path: Path,
-    max_items: int = 80,
-    delay: float = 1.0,
-    dry_run: bool = False,
-    enabled_sources: tuple[str, ...] = (),
-) -> int:
+# ============================================================
+# RECHECK EXISTING REVIEW REQUIRED RECORDS
+# ============================================================
 
-    """Collect new announcements without deleting old records."""
+def review_existing(
+    df,
+    session,
+    limit,
+    delay,
+):
+    """
+    Revisit announcements previously marked
+    Needs Manual Review.
+
+    Update them when the article contains
+    clear evidence of an acquisition, exit,
+    or non-deal announcement.
+
+    Do not overwrite records already verified
+    by a person.
+    """
+
+    changed = 0
+
+    for index, row in df.iterrows():
+
+        if changed >= limit:
+            break
+
+        old_type = row.get(
+            "transaction_type",
+            "",
+        )
+
+        if old_type not in (
+            "Needs Manual Review",
+            "REVIEW REQUIRED",
+        ):
+            continue
+
+        status = str(
+            row.get(
+                "review_status",
+                "",
+            )
+        ).lower()
+
+        if status.startswith("verified"):
+            continue
+
+        url = row.get("url", "")
+
+        if not url.startswith(
+            ("https://", "http://")
+        ):
+            continue
+
+        domain = (
+            urlparse(url)
+            .netloc
+            .lower()
+            .removeprefix("www.")
+        )
+
+        allowed_domains = {
+            source["domain"]
+            for source in SOURCES
+        }
+
+        if domain not in allowed_domains:
+            continue
+
+        time.sleep(delay)
+
+        try:
+
+            headline, date, body = article_details(
+                get_html(session, url),
+                row.get("headline", ""),
+            )
+
+            if len(body) < 80:
+                continue
+
+            result = classify(
+                headline,
+                body,
+                row.get(
+                    "source_pe_firm",
+                    "",
+                ),
+            )
+
+            if result["deal_direction"] not in (
+                BUY,
+                SELL,
+                OTHER,
+            ):
+                continue
+
+            # Do not change an unknown deal to a
+            # confirmed-looking classification
+            # unless a target was identified.
+
+            if (
+                result["deal_direction"] in (
+                    BUY,
+                    SELL,
+                )
+                and not result["target_company"]
+            ):
+                continue
+
+            fields = [
+                "transaction_type",
+                "deal_direction",
+                "buyer_entity",
+                "target_company",
+                "target_industry",
+                "strategic_rationale",
+                "deal_value_disclosed",
+                "evidence_snippet",
+            ]
+
+            for field in fields:
+
+                df.at[index, field] = (
+                    result[field]
+                )
+
+            df.at[
+                index,
+                "review_status",
+            ] = (
+                "Reclassified from full text — "
+                "pending manual verification"
+            )
+
+            if (
+                not str(
+                    row.get(
+                        "announcement_date",
+                        "",
+                    )
+                ).strip()
+                and date
+            ):
+
+                df.at[
+                    index,
+                    "announcement_date",
+                ] = date
+
+            # Never automatically mark
+            # is_verified_deal as True.
+
+            changed += 1
+
+            LOG.info(
+                "Reclassified: %s -> %s",
+                row.get("headline", ""),
+                result["transaction_type"],
+            )
+
+        except (
+            requests.RequestException,
+            ValueError,
+        ) as error:
+
+            LOG.warning(
+                "Unable to recheck %s: %s",
+                url,
+                error,
+            )
+
+    return changed
+
+
+# ============================================================
+# MAIN UPDATE WORKFLOW
+# ============================================================
+
+def update(
+    csv_path,
+    max_items=80,
+    delay=1.0,
+    dry_run=False,
+    enabled_sources=(),
+    max_rechecks=50,
+):
 
     if csv_path.exists():
+
         existing = pd.read_csv(
             csv_path,
             dtype=str,
             keep_default_na=False,
         )
+
     else:
-        existing = pd.DataFrame(columns=COLUMNS)
+
+        existing = pd.DataFrame(
+            columns=COLUMNS
+        )
+
+    for column in COLUMNS:
+
+        if column not in existing:
+            existing[column] = ""
+
+    existing = existing.copy()
+
+    session = requests.Session()
+
+    session.headers.update(
+        HEADERS
+    )
+
+    # --------------------------------------------------------
+    # RECHECK OLD UNCLASSIFIED ANNOUNCEMENTS
+    # --------------------------------------------------------
+
+    corrected = review_existing(
+        existing,
+        session,
+        max_rechecks,
+        delay,
+    )
+
+    # --------------------------------------------------------
+    # DUPLICATE PROTECTION
+    # --------------------------------------------------------
 
     known_urls = {
         canonical_url(url)
-        for url in existing.get(
-            "url",
-            pd.Series(dtype=str)
-        )
-        if str(url).strip().startswith("http")
+        for url in existing["url"]
+        if url.startswith("http")
     }
 
     known_titles = {
         (
-            str(row.get("source_pe_firm", "")).lower(),
-            normalized_title(row.get("headline", "")),
+            str(
+                row["source_pe_firm"]
+            ).lower(),
+            title_key(
+                row["headline"]
+            ),
         )
         for _, row in existing.iterrows()
     }
 
     collected = []
-    reachable_index_pages = 0
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    index_count = 0
+
+    # --------------------------------------------------------
+    # PROCESS EACH PRIVATE EQUITY FIRM
+    # --------------------------------------------------------
 
     for source in SOURCES:
 
         if (
             enabled_sources
-            and source["code"].lower() not in enabled_sources
+            and source["code"].lower()
+            not in enabled_sources
         ):
             continue
 
-        candidate_links = {}
+        links = {}
 
-        # Visit current and historical news pages
+        # Read current and historical news indexes.
 
         for page in source["pages"]:
 
             try:
-                soup = get_html(session, page)
-                reachable_index_pages += 1
 
-                links = discover_links(
+                soup = get_html(
+                    session,
+                    page,
+                )
+
+                index_count += 1
+
+                discovered = discover_links(
                     soup,
                     page,
-                    source["domain"]
+                    source["domain"],
                 )
 
-                for url, title in links:
-                    candidate_links.setdefault(url, title)
+                for url, title in discovered:
 
-                LOG.info(
-                    "%s index: %s candidate articles",
-                    source["code"],
-                    len(candidate_links),
-                )
+                    links.setdefault(
+                        url,
+                        title,
+                    )
 
             except requests.RequestException as error:
+
                 LOG.warning(
-                    "Cannot access %s: %s",
+                    "News page unavailable %s: %s",
                     page,
                     error,
                 )
 
             time.sleep(delay)
 
-        queued = 0
+        added_from_source = 0
 
-        # Visit individual articles
+        # ----------------------------------------------------
+        # OPEN EACH NEW ARTICLE
+        # ----------------------------------------------------
 
-        for url, title in candidate_links.items():
+        for url, title in links.items():
 
-            if queued >= max_items:
+            if added_from_source >= max_items:
                 break
 
             key = (
                 source["name"].lower(),
-                normalized_title(title),
+                title_key(title),
             )
 
-            if url in known_urls or key in known_titles:
+            if (
+                url in known_urls
+                or key in known_titles
+            ):
                 continue
 
-            queued += 1
             time.sleep(delay)
 
             try:
-                article = get_html(session, url)
 
                 headline, date, body = article_details(
-                    article,
+                    get_html(
+                        session,
+                        url,
+                    ),
                     title,
                 )
 
                 key = (
                     source["name"].lower(),
-                    normalized_title(headline),
+                    title_key(headline),
                 )
 
                 if (
                     url in known_urls
                     or key in known_titles
+                    or len(body) < 80
                 ):
-                    continue
-
-                if len(body) < 60:
-                    LOG.warning(
-                        "Article has insufficient text: %s",
-                        url,
-                    )
                     continue
 
                 record = {
@@ -648,13 +1128,18 @@ def update(
                             url.encode()
                         ).hexdigest()[:12]
                     ),
-                    "source_pe_firm": source["name"],
+                    "source_pe_firm": (
+                        source["name"]
+                    ),
                     "headline": headline,
                     "url": url,
                     "announcement_date": date,
                     "collection_date": (
-                        datetime.now(timezone.utc)
-                        .strftime("%Y-%m-%d %H:%M:%S UTC")
+                        datetime.now(
+                            timezone.utc
+                        ).strftime(
+                            "%Y-%m-%d %H:%M:%S UTC"
+                        )
                     ),
                     **classify(
                         headline,
@@ -662,56 +1147,84 @@ def update(
                         source["name"],
                     ),
                     "data_origin": (
-                        "Live article scrape - pending review"
+                        "Live full-article scrape — "
+                        "pending source review"
                     ),
                 }
 
                 collected.append(record)
+
                 known_urls.add(url)
+
                 known_titles.add(key)
 
+                added_from_source += 1
+
             except requests.RequestException as error:
+
                 LOG.warning(
-                    "Cannot access article %s: %s",
+                    "Article unavailable %s: %s",
                     url,
                     error,
                 )
 
-    if reachable_index_pages == 0:
-        raise RuntimeError(
-            "No source news pages could be reached. "
-            "Existing CSV was not changed."
+        LOG.info(
+            "%s: %s new announcements",
+            source["code"],
+            added_from_source,
         )
 
-    if not collected:
-        LOG.info(
-            "No new unique announcements. CSV unchanged."
+    # --------------------------------------------------------
+    # SAVE UPDATED DATA
+    # --------------------------------------------------------
+
+    if not index_count and not corrected:
+
+        raise RuntimeError(
+            "No news pages reached and no records "
+            "changed. Existing CSV preserved."
         )
+
+    if not collected and not corrected:
+
+        LOG.info(
+            "No new records or reclassifications. "
+            "CSV unchanged."
+        )
+
         return 0
 
     combined = pd.concat(
-        [existing, pd.DataFrame(collected)],
+        [
+            existing,
+            pd.DataFrame(collected),
+        ],
         ignore_index=True,
     )
 
     combined = combined.reindex(
         columns=list(
-            dict.fromkeys([
-                *existing.columns,
-                *COLUMNS,
-            ])
+            dict.fromkeys(
+                [
+                    *existing.columns,
+                    *COLUMNS,
+                ]
+            )
         ),
         fill_value="",
     )
 
     if dry_run:
+
         LOG.info(
-            "DRY RUN: would add %s records.",
+            "DRY RUN: would reclassify %s "
+            "and add %s records.",
+            corrected,
             len(collected),
         )
-        LOG.info("CSV was NOT changed.")
 
     else:
+
         csv_path.parent.mkdir(
             parents=True,
             exist_ok=True,
@@ -723,35 +1236,26 @@ def update(
         )
 
         LOG.info(
-            "Added %s records. Total: %s",
+            "Saved: %s reclassified, "
+            "%s new; total %s records.",
+            corrected,
             len(collected),
             len(combined),
         )
 
-    for sponsor in sorted({
-        row["source_pe_firm"]
-        for row in collected
-    }):
-        count = sum(
-            row["source_pe_firm"] == sponsor
-            for row in collected
-        )
+    return len(collected) + corrected
 
-        LOG.info(
-            "%s: %s new announcements",
-            sponsor,
-            count,
-        )
 
-    return len(collected)
-
+# ============================================================
+# GITHUB ACTIONS ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description=(
-            "Collect Norwest and Tonka Bay "
-            "historical announcements"
+            "SponsorPulse full-article "
+            "announcement collection"
         )
     )
 
@@ -773,13 +1277,23 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--max-rechecks",
+        type=int,
+        default=50,
+    )
+
+    parser.add_argument(
         "--dry-run",
         action="store_true",
     )
 
     parser.add_argument(
         "--source",
-        choices=["all", "nep", "tonka"],
+        choices=[
+            "all",
+            "nep",
+            "tonka",
+        ],
         default="all",
     )
 
@@ -791,18 +1305,27 @@ if __name__ == "__main__":
     )
 
     try:
-        selected = (
-            ()
-            if args.source == "all"
-            else (args.source,)
-        )
 
         update(
             Path(args.csv),
-            max_items=max(1, args.max_items),
-            delay=max(0.5, args.delay),
+            max_items=max(
+                1,
+                args.max_items,
+            ),
+            delay=max(
+                0,
+                args.delay,
+            ),
             dry_run=args.dry_run,
-            enabled_sources=selected,
+            enabled_sources=(
+                ()
+                if args.source == "all"
+                else (args.source,)
+            ),
+            max_rechecks=max(
+                0,
+                args.max_rechecks,
+            ),
         )
 
     except (
@@ -811,7 +1334,8 @@ if __name__ == "__main__":
     ) as error:
 
         LOG.error(
-            "Collection failed. CSV preserved: %s",
+            "Collection failed without "
+            "overwriting data: %s",
             error,
         )
 
